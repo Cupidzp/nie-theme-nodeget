@@ -68,6 +68,33 @@ export class RpcClient {
     return this.readyPromise
   }
 
+  private rejectPending(error: Error) {
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer)
+      p.reject(error)
+    }
+    this.pending.clear()
+    this.outbox = []
+  }
+
+  private reconnectAfterBrokenSocket(error: Error) {
+    if (this.closed) return
+    this.rejectPending(error)
+    const ws = this.ws
+    if (!ws) {
+      this.resetReady()
+      setTimeout(() => this.connect(), RECONNECT_DELAY_MS)
+      return
+    }
+    try {
+      ws.close()
+    } catch {
+      if (this.ws === ws) this.ws = null
+      this.resetReady()
+      setTimeout(() => this.connect(), RECONNECT_DELAY_MS)
+    }
+  }
+
   private connect() {
     if (this.closed) return
     if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return
@@ -124,6 +151,7 @@ export class RpcClient {
       } else {
         log(this.name, `close code=${ev.code} pending=${this.pending.size}`)
       }
+      this.rejectPending(new Error(`连接 ${this.url} 已断开`))
       if (!this.closed) {
         this.resetReady()
         setTimeout(() => this.connect(), RECONNECT_DELAY_MS)
@@ -152,8 +180,10 @@ export class RpcClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
+        const error = new Error(`${method} 超时`)
         warn(this.name, `× ${method} timeout ${timeout}ms`)
-        reject(new Error(`${method} 超时`))
+        reject(error)
+        this.reconnectAfterBrokenSocket(error)
       }, timeout)
       this.pending.set(id, {
         method,
@@ -162,20 +192,23 @@ export class RpcClient {
         reject,
         timer,
       })
-      if (queued) this.outbox.push(payload)
-      else this.ws!.send(payload)
+      try {
+        if (queued) this.outbox.push(payload)
+        else this.ws!.send(payload)
+      } catch (e) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        const error = e instanceof Error ? e : new Error(String(e))
+        reject(error)
+        this.reconnectAfterBrokenSocket(error)
+      }
     })
   }
 
   close() {
     this.closed = true
     this.rejectReady(new Error('connection closed'))
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer)
-      p.reject(new Error('connection closed'))
-    }
-    this.pending.clear()
-    this.outbox = []
+    this.rejectPending(new Error('connection closed'))
     this.ws?.close()
     this.ws = null
   }

@@ -4,6 +4,7 @@ import type { BackendPool } from '../api/pool'
 import type { TaskQueryResult } from '../types'
 
 const DEFAULT_REFRESH_MS = 180_000
+const ERROR_RETRY_MS = 30_000
 const QUERY_TIMEOUT_MS = 12_000
 const AVAILABILITY_WINDOW_MS = 4 * 60 * 60 * 1000
 const MAX_CONCURRENT = 2
@@ -169,7 +170,8 @@ function scheduleFetch(
   if (!enabled || !pool || !source || !uuid) return
   const key = queryKey(source, uuid)
   const state = getSnapshot(source, uuid, windowMs)
-  const isStale = !state.updatedAt || Date.now() - state.updatedAt >= refreshMs
+  const cooldownMs = state.error ? Math.min(refreshMs, ERROR_RETRY_MS) : refreshMs
+  const isStale = !state.updatedAt || Date.now() - state.updatedAt >= cooldownMs
   if (!isStale || inflight.has(key)) return
 
   const existing = queued.get(key)
@@ -205,13 +207,26 @@ export function useNodeTcpLatency(
     scheduleFetch(pool, source, uuid, { enabled, refreshMs, priority, windowMs })
     if (!enabled || !pool || !source || !uuid) return unsubscribe
 
+    const triggerFetch = (nextPriority: Priority = priority) => {
+      scheduleFetch(pool, source, uuid, { enabled: true, refreshMs, priority: nextPriority, windowMs })
+    }
+    const onWake = () => {
+      if (document.visibilityState === 'visible') triggerFetch('high')
+    }
+
     const timer = window.setInterval(() => {
-      scheduleFetch(pool, source, uuid, { enabled: true, refreshMs, priority, windowMs })
+      triggerFetch(priority)
     }, Math.max(15_000, refreshMs))
+    document.addEventListener('visibilitychange', onWake)
+    window.addEventListener('focus', onWake)
+    window.addEventListener('online', onWake)
 
     return () => {
       unsubscribe()
       window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onWake)
+      window.removeEventListener('focus', onWake)
+      window.removeEventListener('online', onWake)
     }
   }, [pool, source, uuid, currentKey, enabled, refreshMs, priority, windowMs])
 
